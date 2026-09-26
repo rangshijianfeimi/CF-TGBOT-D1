@@ -57,6 +57,52 @@ const USER_UPDATE_FIELDS = new Set([
 ]);
 
 let migrationPromise = null;
+let botCommandsPromise = null;
+
+async function ensureBotCommands(env) {
+  if (botCommandsPromise) {
+    return botCommandsPromise;
+  }
+
+  botCommandsPromise = telegramApi(
+    env.BOT_TOKEN,
+    'setMyCommands',
+    {
+      commands: [
+        {
+          command: 'ban',
+          description: '封禁当前话题用户'
+        },
+        {
+          command: 'unban',
+          description: '解除当前话题用户封禁'
+        },
+        {
+          command: 'delete',
+          description: '删除被回复的消息'
+        },
+{
+  command: 'terminate',
+  description: '删除当前用户话题'
+},
+{
+  command: 'card',
+  description: '重新创建当前用户资料卡'
+}
+      ]
+    }
+  ).catch((error) => {
+    botCommandsPromise = null;
+
+    console.error(
+      '注册机器人命令失败：',
+      error?.message || error
+    );
+  });
+
+  return botCommandsPromise;
+}
+
 
 /* -------------------------------------------------------------------------- */
 /*                               通用辅助函数                                   */
@@ -84,6 +130,13 @@ function safeJsonParse(str, fallback) {
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+function isMessageNotModifiedError(error) {
+  return String(error?.message || error)
+    .toLowerCase()
+    .includes('message is not modified');
+}
+
 
 function toBoolText(value, defaultValue = true) {
   if (typeof value !== 'string') return defaultValue;
@@ -1298,18 +1351,21 @@ ${firstTimeText}
   };
 }
 
-function getProfileUrl(userId, usernameRaw) {
+function getProfileUrl(usernameRaw) {
+  const username = String(
+    usernameRaw || ''
+  ).trim();
+
   if (
-    usernameRaw &&
-    /^[A-Za-z0-9_]{5,32}$/.test(usernameRaw)
+    !/^[A-Za-z0-9_]{5,32}$/.test(username)
   ) {
-    return (
-      `https://t.me/` +
-      encodeURIComponent(usernameRaw)
-    );
+    return null;
   }
 
-  return `tg://user?id=${userId}`;
+  return (
+    `https://t.me/` +
+    encodeURIComponent(username)
+  );
 }
 
 function getInfoCardButtons(
@@ -1318,48 +1374,62 @@ function getInfoCardButtons(
   isMuted,
   usernameRaw = ''
 ) {
-  return {
-    inline_keyboard: [
-      [
-        {
-          text: isBlocked
-            ? '✅ 解除屏蔽'
-            : '🚫 屏蔽用户',
-          callback_data:
-            `${isBlocked ? 'unblock' : 'block'}:` +
-            `${userId}`
-        },
-        {
-          text: isMuted
-            ? '🔔 恢复通知'
-            : '🔕 静音通知',
-          callback_data:
-            `${isMuted ? 'unmute' : 'mute'}:` +
-            `${userId}`
-        }
-      ],
-      [
-        {
-          text: '📌 置顶资料卡',
-          callback_data: `pin_card:${userId}`
-        },
-        {
-          text: '🔄 刷新资料卡',
-          callback_data: `refresh_card:${userId}`
-        }
-      ],
-      [
-        {
-          text: '👤 查看资料',
-          url: getProfileUrl(
-            userId,
-            usernameRaw
-          )
-        }
-      ]
+  const rows = [
+    [
+      {
+        text: isBlocked
+          ? '✅ 解除屏蔽'
+          : '🚫 屏蔽用户',
+        callback_data:
+          `${isBlocked ? 'unblock' : 'block'}:` +
+          `${userId}`
+      },
+      {
+        text: isMuted
+          ? '🔔 恢复通知'
+          : '🔕 静音通知',
+        callback_data:
+          `${isMuted ? 'unmute' : 'mute'}:` +
+          `${userId}`
+      }
+    ],
+    [
+      {
+        text: '📌 置顶资料卡',
+        callback_data: `pin_card:${userId}`
+      },
+      {
+        text: '🔄 刷新资料卡',
+        callback_data:
+          `refresh_card:${userId}`
+      }
     ]
+  ];
+
+  const profileUrl =
+    getProfileUrl(usernameRaw);
+
+  /*
+   * 只有用户具有有效公开用户名时，
+   * 才显示“查看资料”按钮。
+   *
+   * 不再使用 tg://user?id=... 作为按钮链接，
+   * 避免 BUTTON_USER_PRIVACY_RESTRICTED。
+   */
+  if (profileUrl) {
+    rows.push([
+      {
+        text: '👤 查看资料',
+        url: profileUrl
+      }
+    ]);
+  }
+
+  return {
+    inline_keyboard: rows
   };
 }
+
 
 function buildCardSignature(payload) {
   return JSON.stringify({
@@ -1418,24 +1488,36 @@ async function refreshUserInfoCard(
     };
   }
 
-  await telegramApi(
-    env.BOT_TOKEN,
-    'editMessageText',
-    {
-      chat_id: env.ADMIN_GROUP_ID,
-      message_id: Number(
-        user.info_card_message_id
-      ),
-      text: payload.infoCard,
-      parse_mode: 'HTML',
-      reply_markup: getInfoCardButtons(
-        userId,
-        user.is_blocked,
-        user.is_muted,
-        payload.usernameRaw
-      )
+    try {
+    await telegramApi(
+      env.BOT_TOKEN,
+      'editMessageText',
+      {
+        chat_id: env.ADMIN_GROUP_ID,
+        message_id: Number(
+          user.info_card_message_id
+        ),
+        text: payload.infoCard,
+        parse_mode: 'HTML',
+        reply_markup: getInfoCardButtons(
+          userId,
+          user.is_blocked,
+          user.is_muted,
+          payload.usernameRaw
+        )
+      }
+    );
+  } catch (error) {
+    if (isMessageNotModifiedError(error)) {
+      return {
+        updated: false,
+        reason: 'not_modified'
+      };
     }
-  );
+
+    throw error;
+  }
+
 
   await dbUserUpdate(
     userId,
@@ -1533,6 +1615,185 @@ async function createInfoCard(
 
   return sent.message_id;
 }
+const infoCardPromises = new Map();
+
+async function ensureUserInfoCard(
+  message,
+  user,
+  topicId,
+  env
+) {
+  const userId = String(message.from.id);
+  const lockKey = `${userId}:${topicId}`;
+
+  const freshUser = await dbUserGetOrCreate(
+    userId,
+    env
+  );
+
+  if (freshUser.info_card_message_id) {
+    return freshUser.info_card_message_id;
+  }
+
+  if (infoCardPromises.has(lockKey)) {
+    return infoCardPromises.get(lockKey);
+  }
+
+  const task = (async () => {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const currentUser =
+        await dbUserGetOrCreate(userId, env);
+
+      if (currentUser.info_card_message_id) {
+        return currentUser.info_card_message_id;
+      }
+
+      try {
+        return await createInfoCard(
+          message,
+          currentUser,
+          topicId,
+          env
+        );
+      } catch (error) {
+        lastError = error;
+
+        console.error(
+          `创建资料卡失败（${attempt}/3），用户 ${userId}：`,
+          error?.message || error
+        );
+
+        if (attempt < 3) {
+          await sleep(attempt * 500);
+        }
+      }
+    }
+
+    console.error(
+      `用户 ${userId} 的资料卡创建失败：`,
+      lastError?.message || lastError
+    );
+
+    return null;
+  })();
+
+  infoCardPromises.set(lockKey, task);
+
+  try {
+    return await task;
+  } finally {
+    if (infoCardPromises.get(lockKey) === task) {
+      infoCardPromises.delete(lockKey);
+    }
+  }
+}
+
+async function recreateUserInfoCard(
+  userId,
+  topicId,
+  env
+) {
+  const normalizedUserId = String(userId);
+  const normalizedTopicId = String(topicId);
+
+  let user = await dbUserGetOrCreate(
+    normalizedUserId,
+    env
+  );
+
+  const oldCardMessageId =
+    user.info_card_message_id;
+
+  const userInfo = user.user_info || {};
+
+  const displayName =
+    String(userInfo.name || '').trim() ||
+    `用户 ${normalizedUserId}`;
+
+  const usernameRaw =
+    String(userInfo.username_raw || '').trim();
+
+  const firstMessageDate = Number(
+    userInfo.first_message_date ||
+    user.created_at ||
+    Math.floor(Date.now() / 1000)
+  );
+
+  await dbUserUpdate(
+    normalizedUserId,
+    {
+      topic_id: normalizedTopicId,
+      info_card_message_id: null,
+      topic_creating: false,
+      topic_lock_at: null
+    },
+    env
+  );
+
+  user = await dbUserGetOrCreate(
+    normalizedUserId,
+    env
+  );
+
+  const syntheticMessage = {
+    from: {
+      id: normalizedUserId,
+      first_name: displayName,
+      username: usernameRaw || undefined
+    },
+    date: firstMessageDate
+  };
+
+  let newCardMessageId;
+
+  try {
+    newCardMessageId = await createInfoCard(
+      syntheticMessage,
+      user,
+      normalizedTopicId,
+      env
+    );
+  } catch (error) {
+    // 重建失败时恢复旧资料卡 ID，避免数据库状态进一步损坏。
+    await dbUserUpdate(
+      normalizedUserId,
+      {
+        info_card_message_id:
+          oldCardMessageId || null
+      },
+      env
+    );
+
+    throw error;
+  }
+
+  // 新卡创建成功后再删除旧卡，避免先删除后创建失败。
+  if (
+    oldCardMessageId &&
+    String(oldCardMessageId) !==
+      String(newCardMessageId)
+  ) {
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'deleteMessage',
+        {
+          chat_id: env.ADMIN_GROUP_ID,
+          message_id: Number(oldCardMessageId)
+        }
+      );
+    } catch (error) {
+      console.warn(
+        `旧资料卡不存在或无法删除，用户 ${normalizedUserId}：`,
+        error?.message || error
+      );
+    }
+  }
+
+  return newCardMessageId;
+}
 
 async function waitForUserTopic(userId, env) {
   for (let i = 0; i < 12; i += 1) {
@@ -1565,25 +1826,18 @@ async function ensureUserTopic(
     existingUser ||
     await dbUserGetOrCreate(userId, env);
 
-  if (user.topic_id) {
-    if (!user.info_card_message_id) {
-      try {
-        await createInfoCard(
-          message,
-          user,
-          user.topic_id,
-          env
-        );
-      } catch (error) {
-        console.error(
-          '补建资料卡失败：',
-          error?.message || error
-        );
-      }
-    }
-
-    return user.topic_id;
+if (user.topic_id) {
+  if (!user.info_card_message_id) {
+    await ensureUserInfoCard(
+      message,
+      user,
+      user.topic_id,
+      env
+    );
   }
+
+  return user.topic_id;
+}
 
   const now = Math.floor(Date.now() / 1000);
   const staleTime =
@@ -1667,19 +1921,12 @@ async function ensureUserTopic(
       env
     );
 
-    try {
-      await createInfoCard(
-        message,
-        user,
-        topicId,
-        env
-      );
-    } catch (error) {
-      console.error(
-        '创建用户资料卡失败：',
-        error?.message || error
-      );
-    }
+    await ensureUserInfoCard(
+      message,
+      user,
+      topicId,
+      env
+    );
 
     return topicId;
   } catch (error) {
@@ -1793,12 +2040,31 @@ async function relayUserMessageToTopic(
   user,
   env
 ) {
-  let topicId = user.topic_id;
+  const userId = String(message.from.id);
 
-  if (!topicId) {
-    topicId = await ensureUserTopic(
+  // 获取最新用户状态，防止并发请求使用过期数据。
+  let freshUser = await dbUserGetOrCreate(
+    userId,
+    env
+  );
+
+  // 统一确保话题存在，同时补建缺失的资料卡。
+  let topicId = await ensureUserTopic(
+    message,
+    freshUser,
+    env
+  );
+
+  freshUser = await dbUserGetOrCreate(
+    userId,
+    env
+  );
+
+  if (!freshUser.info_card_message_id) {
+    await ensureUserInfoCard(
       message,
-      user,
+      freshUser,
+      topicId,
       env
     );
   } else {
@@ -1822,8 +2088,8 @@ async function relayUserMessageToTopic(
           message.message_id,
         disable_notification:
           Boolean(
-            user.is_blocked ||
-            user.is_muted
+            freshUser.is_blocked ||
+            freshUser.is_muted
           )
       }
     );
@@ -1838,7 +2104,7 @@ async function relayUserMessageToTopic(
     );
 
     await dbUserUpdate(
-      String(message.from.id),
+      userId,
       {
         topic_id: null,
         info_card_message_id: null,
@@ -1850,7 +2116,7 @@ async function relayUserMessageToTopic(
 
     const refreshedUser =
       await dbUserGetOrCreate(
-        message.from.id,
+        userId,
         env
       );
 
@@ -1860,6 +2126,21 @@ async function relayUserMessageToTopic(
         refreshedUser,
         env
       );
+
+    const newestUser =
+      await dbUserGetOrCreate(
+        userId,
+        env
+      );
+
+    if (!newestUser.info_card_message_id) {
+      await ensureUserInfoCard(
+        message,
+        newestUser,
+        newTopicId,
+        env
+      );
+    }
 
     await telegramApi(
       env.BOT_TOKEN,
@@ -1874,11 +2155,13 @@ async function relayUserMessageToTopic(
           message.message_id,
         disable_notification:
           Boolean(
-            user.is_blocked ||
-            user.is_muted
+            newestUser.is_blocked ||
+            newestUser.is_muted
           )
       }
     );
+
+    topicId = newTopicId;
   }
 
   await saveUserMessageRecord(
@@ -1886,7 +2169,6 @@ async function relayUserMessageToTopic(
     env
   );
 }
-
 async function relayAdminMessageToUser(
   message,
   userId,
@@ -3226,6 +3508,415 @@ async function handlePrivateMessage(
 /* -------------------------------------------------------------------------- */
 /*                              管理员回复处理                                   */
 /* -------------------------------------------------------------------------- */
+function parseAdminCommand(text) {
+  const value = String(text || '').trim();
+
+  const match = value.match(
+    /^\/([a-zA-Z_]+)(?:@\w+)?(?:\s+(.+))?$/
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  return {
+    command: match[1].toLowerCase(),
+    argument: match[2]?.trim() || ''
+  };
+}
+
+async function resolveTopicUserId(
+  message,
+  env,
+  argument = ''
+) {
+  if (argument) {
+    const userId = argument
+      .split(/\s+/)[0]
+      .trim();
+
+    if (/^\d+$/.test(userId)) {
+      return userId;
+    }
+
+    return null;
+  }
+
+  if (!message?.message_thread_id) {
+    return null;
+  }
+
+  return dbTopicUserGet(
+    String(message.message_thread_id),
+    env
+  );
+}
+
+async function sendTopicNotice(
+  message,
+  text,
+  env
+) {
+  return telegramApi(
+    env.BOT_TOKEN,
+    'sendMessage',
+    {
+      chat_id: env.ADMIN_GROUP_ID,
+      message_thread_id:
+        Number(message.message_thread_id),
+      text
+    }
+  );
+}
+
+async function handleAdminCommand(
+  message,
+  env
+) {
+  const parsed =
+    parseAdminCommand(message.text);
+
+  if (!parsed) {
+    return false;
+  }
+
+  const allowedCommands = new Set([
+  'ban',
+  'unban',
+  'delete',
+  'terminate',
+  'card'
+]);
+
+  if (!allowedCommands.has(parsed.command)) {
+    return false;
+  }
+
+  const senderId =
+    String(message.from?.id || '');
+
+  const isAdmin =
+    await isAdminUser(senderId, env);
+
+  if (!isAdmin) {
+    return true;
+  }
+
+  const topicId = String(
+    message.message_thread_id || ''
+  );
+
+  if (!topicId) {
+    await telegramApi(
+      env.BOT_TOKEN,
+      'sendMessage',
+      {
+        chat_id: env.ADMIN_GROUP_ID,
+        text:
+          '⚠️ 这些命令只能在用户话题中使用。'
+      }
+    );
+
+    return true;
+  }
+
+  if (parsed.command === 'ban') {
+    const userId =
+      await resolveTopicUserId(
+        message,
+        env,
+        parsed.argument
+      );
+
+    if (!userId) {
+      await sendTopicNotice(
+        message,
+        '❌ 找不到该话题对应的用户 ID。\n' +
+        '也可以使用：/ban 用户ID',
+        env
+      );
+
+      return true;
+    }
+
+    const user =
+      await dbUserGetOrCreate(
+        userId,
+        env
+      );
+
+    await dbUserUpdate(
+      userId,
+      {
+        is_blocked: true
+      },
+      env
+    );
+
+    await sendTopicNotice(
+      message,
+      `🚫 已封禁用户 ${userId}。`,
+      env
+    );
+
+    if (!user.is_blocked) {
+      try {
+        await telegramApi(
+          env.BOT_TOKEN,
+          'sendMessage',
+          {
+            chat_id: userId,
+            text:
+              '⚠️ 您已被管理员封禁，' +
+              '无法继续发送消息。'
+          }
+        );
+      } catch (error) {
+        console.error(
+          '发送封禁通知失败：',
+          error?.message || error
+        );
+      }
+    }
+
+    return true;
+  }
+
+  if (parsed.command === 'unban') {
+    const userId =
+      await resolveTopicUserId(
+        message,
+        env,
+        parsed.argument
+      );
+
+    if (!userId) {
+      await sendTopicNotice(
+        message,
+        '❌ 找不到该话题对应的用户 ID。\n' +
+        '也可以使用：/unban 用户ID',
+        env
+      );
+
+      return true;
+    }
+
+    await dbUserUpdate(
+      userId,
+      {
+        is_blocked: false,
+        block_count: 0
+      },
+      env
+    );
+
+    await sendTopicNotice(
+      message,
+      `✅ 已解除用户 ${userId} 的封禁。`,
+      env
+    );
+
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'sendMessage',
+        {
+          chat_id: userId,
+          text:
+            '✅ 管理员已解除对您的封禁，' +
+            '现在可以继续发送消息。'
+        }
+      );
+    } catch (error) {
+      console.error(
+        '发送解禁通知失败：',
+        error?.message || error
+      );
+    }
+
+    return true;
+  }
+
+  if (parsed.command === 'delete') {
+    const repliedMessage =
+      message.reply_to_message;
+
+    if (!repliedMessage?.message_id) {
+      await sendTopicNotice(
+        message,
+        '⚠️ 请先回复要删除的消息，再发送 /delete。',
+        env
+      );
+
+      return true;
+    }
+
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'deleteMessage',
+        {
+          chat_id: env.ADMIN_GROUP_ID,
+          message_id:
+            repliedMessage.message_id
+        }
+      );
+
+      await telegramApi(
+        env.BOT_TOKEN,
+        'deleteMessage',
+        {
+          chat_id: env.ADMIN_GROUP_ID,
+          message_id:
+            message.message_id
+        }
+      );
+    } catch (error) {
+      await sendTopicNotice(
+        message,
+        `❌ 删除消息失败：` +
+        `${error?.message || error}`,
+        env
+      );
+    }
+
+    return true;
+  }
+if (parsed.command === 'card') {
+  const userId =
+    await resolveTopicUserId(
+      message,
+      env,
+      parsed.argument
+    );
+
+  if (!userId) {
+    await sendTopicNotice(
+      message,
+      '❌ 找不到当前话题对应的用户 ID。\n' +
+      '映射丢失时可以使用：/card 用户ID',
+      env
+    );
+
+    return true;
+  }
+
+  try {
+    await dbUserGetOrCreate(userId, env);
+
+    // 指定用户 ID 时，将当前话题重新绑定给该用户。
+    if (parsed.argument) {
+      await env.TG_BOT_DB.prepare(`
+        UPDATE users
+        SET
+          topic_id = NULL,
+          info_card_message_id = NULL,
+          topic_creating = 0,
+          topic_lock_at = NULL,
+          updated_at = ?
+        WHERE topic_id = ?
+          AND user_id <> ?
+      `).bind(
+        Math.floor(Date.now() / 1000),
+        topicId,
+        String(userId)
+      ).run();
+
+      await dbUserUpdate(
+        userId,
+        {
+          topic_id: topicId,
+          topic_creating: false,
+          topic_lock_at: null
+        },
+        env
+      );
+    }
+
+    await recreateUserInfoCard(
+      userId,
+      topicId,
+      env
+    );
+
+    await sendTopicNotice(
+      message,
+      `✅ 用户 ${userId} 的资料卡已重新创建。`,
+      env
+    );
+  } catch (error) {
+    console.error(
+      `重建用户 ${userId} 的资料卡失败：`,
+      error?.stack ||
+      error?.message ||
+      error
+    );
+
+    await sendTopicNotice(
+      message,
+      `❌ 重新创建资料卡失败：` +
+      `${error?.message || error}`,
+      env
+    );
+  }
+
+  return true;
+}
+
+  if (parsed.command === 'terminate') {
+    const userId =
+      await resolveTopicUserId(
+        message,
+        env,
+        parsed.argument
+      );
+
+    if (!userId) {
+      await sendTopicNotice(
+        message,
+        '❌ 找不到该话题对应的用户 ID。\n' +
+        '也可以使用：/terminate 用户ID',
+        env
+      );
+
+      return true;
+    }
+
+    try {
+      await telegramApi(
+        env.BOT_TOKEN,
+        'deleteForumTopic',
+        {
+          chat_id: env.ADMIN_GROUP_ID,
+          message_thread_id:
+            Number(topicId)
+        }
+      );
+
+      await dbUserUpdate(
+        userId,
+        {
+          topic_id: null,
+          info_card_message_id: null,
+          topic_creating: false,
+          topic_lock_at: null
+        },
+        env
+      );
+    } catch (error) {
+      await sendTopicNotice(
+        message,
+        `❌ 删除话题失败：` +
+        `${error?.message || error}`,
+        env
+      );
+    }
+
+    return true;
+  }
+
+  return false;
+}
 
 async function handleAdminReply(
   message,
@@ -3256,11 +3947,27 @@ async function handleAdminReply(
     await isAdminUser(senderId, env);
 
   if (!isAdmin) {
+  return;
+}
+
+if (
+  message.text &&
+  message.text.trim().startsWith('/')
+) {
+  const handled =
+    await handleAdminCommand(
+      message,
+      env
+    );
+
+  if (handled) {
     return;
   }
+}
 
-  const topicId =
-    String(message.message_thread_id);
+const topicId =
+  String(message.message_thread_id);
+
 
   const userId =
     await dbTopicUserGet(
@@ -3692,16 +4399,27 @@ async function handleRuleList(
       `第 ${pageInfo.page + 1}/` +
       `${pageInfo.totalPages} 页`;
 
-    rows = pageRules.map((rule, index) => [
-      {
-        text:
-          `删除 ${start + index + 1}. ` +
-          `${String(rule.keywords).slice(0, 25)}`,
-        callback_data:
-          `config:delete:keyword_responses:` +
-          `${rule.id}:${pageInfo.page}`
-      }
-    ]);
+    rows = pageRules.map((rule, index) => {
+  const absoluteIndex = start + index;
+
+  const keywordPreview = Array.from(
+    String(rule.keywords || '')
+  )
+    .slice(0, 25)
+    .join('');
+
+  return [
+    {
+      text:
+        `删除 ${absoluteIndex + 1}. ` +
+        `${keywordPreview}`,
+      callback_data:
+        `config:delete:keyword_responses:` +
+        `${absoluteIndex}:${pageInfo.page}`
+    }
+  ];
+});
+
 
     const navigation = [];
 
@@ -3830,28 +4548,34 @@ async function handleRuleDelete(
   env
 ) {
   if (type === 'keyword_responses') {
-    const rules =
-      await getAutoReplyRules(env);
+  const rules =
+    await getAutoReplyRules(env);
 
-    const next = rules.filter(
-      (rule) =>
-        String(rule.id) !== String(value)
-    );
+  const index = Number(value);
+
+  if (
+    Number.isInteger(index) &&
+    index >= 0 &&
+    index < rules.length
+  ) {
+    rules.splice(index, 1);
 
     await setConfig(
       'keyword_responses',
-      JSON.stringify(next),
-      env
-    );
-
-    return handleRuleList(
-      chatId,
-      messageId,
-      type,
-      page,
+      JSON.stringify(rules),
       env
     );
   }
+
+  return handleRuleList(
+    chatId,
+    messageId,
+    type,
+    page,
+    env
+  );
+}
+
 
   if (type === 'block_keywords') {
     const keywords =
@@ -4261,12 +4985,16 @@ async function handleUserCardCallback(
 
       let tip = '✅ 资料卡已刷新。';
 
-      if (
-        !result.updated &&
-        result.reason === 'missing_card'
-      ) {
-        tip = '⚠️ 找不到资料卡消息。';
+      if (!result.updated) {
+        if (result.reason === 'missing_card') {
+          tip = '⚠️ 找不到资料卡消息。';
+        } else if (
+          result.reason === 'not_modified'
+        ) {
+          tip = '✅ 资料卡已是最新，无需刷新。';
+        }
       }
+
 
       await answerCallback(
         callbackQuery.id,
@@ -4507,6 +5235,10 @@ export default {
     try {
       validateEnvironment(env);
       await ensureMigration(env);
+
+      ctx.waitUntil(
+        ensureBotCommands(env)
+      );
     } catch (error) {
       console.error(
         '初始化失败：',
@@ -4602,9 +5334,10 @@ export default {
       )
     );
 
-    // 随机执行清理，避免每次请求都清理数据库。
     if (Math.random() < 0.01) {
-      ctx.waitUntil(cleanupDatabase(env));
+      ctx.waitUntil(
+        cleanupDatabase(env)
+      );
     }
 
     return new Response('OK', {
